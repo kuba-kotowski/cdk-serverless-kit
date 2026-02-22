@@ -1,0 +1,9 @@
+project_name: CDKServerlessKit # once set it should not be changed, as stack will change and resources will be recreated
+
+region: eu-central-1
+
+env_name: main
+
+api_gateway: true
+
+dynamodb: true

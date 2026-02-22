@@ -1,0 +1,12 @@
+routes:
+  - path: /hello
+    method: GET
+    handler: hello.handler
+
+  - path: /dynamodb
+    method: GET
+    handler: handle_dynamo.get
+
+  - path: /dynamodb
+    method: POST
+    handler: handle_dynamo.post
