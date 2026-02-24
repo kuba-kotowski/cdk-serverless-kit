@@ -5,9 +5,12 @@ from aws_cdk import (
     RemovalPolicy,
     Duration,
     aws_lambda as _lambda,
+    aws_cognito as cognito,
     aws_apigatewayv2 as apigateway2,
     aws_apigatewayv2_integrations as integrations,
+    aws_apigatewayv2_authorizers as authorizers,
     aws_dynamodb as dynamodb,
+    aws_iam as iam,
 )
 from constructs import Construct
 
@@ -31,9 +34,17 @@ class ServerlessStack(Stack):
         # Optional API Gateway
         if config.get("api_gateway"):
             api = self.create_api_gateway()
+            
+            authorizer = None
+            if config.get("auth"):
+                if config["auth"] == "lambda":
+                    authorizer = self.create_lambda_authorizer("auth.handler", table)
+                elif config["auth"] == "cognito":
+                    authorizer = self.create_jwt_authorizer()
+
             routes = self.load_config("routes.yaml")["routes"]
 
-            self.create_from_routes(routes, table, api)
+            self.create_from_routes(routes, table, api, authorizer)
         else:
             self.create_lambdas_standalone(table)
 
@@ -42,18 +53,28 @@ class ServerlessStack(Stack):
             module_name = py_file.replace('.py', '')
             self.create_lambda(f"{self.project_name}-{self.env_name}-{module_name}", f"{module_name}.handler", table)
 
-    def create_from_routes(self, routes, table, api):
+    def create_from_routes(self, routes, table, api, authorizer):
         for route in routes:
+            # Validate required fields
+            if "path" not in route or "handler" not in route:
+                raise ValueError(f"Route missing required 'path' or 'handler': {route}")
+            
             method = route.get("method", "GET")
             path = route["path"]
             handler = route["handler"]
             
-            fn = self.create_lambda(f"{self.project_name}-{self.env_name}-{method}-{path.replace('/', '')}", handler, table)
+            safe_path = path.replace('/', '-').replace('{', '').replace('}', '').strip('-')
+            function_id = f"{self.project_name}-{self.env_name}-{method}-{safe_path}"
+            
+            fn = self.create_lambda(function_id, handler, table)
+            
+            integration_id = f"{method}-{safe_path}-integration"
             
             api.add_routes(
                 path=path,
                 methods=[getattr(apigateway2.HttpMethod, method)],
-                integration=integrations.HttpLambdaIntegration(f"{method}-{path}-integration", fn)
+                integration=integrations.HttpLambdaIntegration(integration_id, fn),
+                authorizer=authorizer if route.get("auth") else None
             )
 
     def create_lambda(self, function_id, handler, table):
@@ -70,7 +91,7 @@ class ServerlessStack(Stack):
         if table:
             table.grant_read_write_data(fn)
             fn.add_environment("DYNAMODB_TABLE", table.table_name)
-        
+
         return fn
 
     def get_lambda_files(self):
@@ -94,7 +115,26 @@ class ServerlessStack(Stack):
             self, 
             api_id, 
             api_name=api_id,
-            create_default_stage=False
+            create_default_stage=False,
+            cors_preflight=apigateway2.CorsPreflightOptions(
+                allow_origins=["*"],
+                allow_methods=[
+                    apigateway2.CorsHttpMethod.GET,
+                    apigateway2.CorsHttpMethod.POST,
+                    apigateway2.CorsHttpMethod.PUT,
+                    apigateway2.CorsHttpMethod.PATCH,
+                    apigateway2.CorsHttpMethod.DELETE,
+                    apigateway2.CorsHttpMethod.OPTIONS
+                ],
+                allow_headers=[
+                    "Content-Type",
+                    "Authorization",
+                    "X-Amz-Date",
+                    "X-Api-Key",
+                    "X-Amz-Security-Token"
+                ],
+                max_age=Duration.days(1)
+            )
         )
         api.add_stage(
             f"{self.env_name}",
@@ -103,6 +143,55 @@ class ServerlessStack(Stack):
 
         return api
 
+    def create_lambda_authorizer(self, auth_handler, table):
+        authorizer_id = f"{self.project_name}-{self.env_name}-LambdaAuthorizer"
+        fn = self.create_lambda(f"{authorizer_id}", auth_handler, table)
+        
+        # Grant Secrets Manager permissions to authorizer if secrets manager is used in the handler
+        fn.add_to_role_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["secretsmanager:GetSecretValue"],
+                resources=[f"arn:aws:secretsmanager:{self.region}:{self.account}:secret:my-api-key-*"]
+            )
+        )
+
+        authorizer = authorizers.HttpLambdaAuthorizer(
+            authorizer_id,
+            handler=fn,
+        )
+
+        return authorizer
+
+    def create_jwt_authorizer(self):
+        user_pool, user_pool_client = self.create_cognito_user_pool()
+
+        authorizer_id = f"{self.project_name}-{self.env_name}-JWTAuthorizer"
+        authorizer = authorizers.HttpJwtAuthorizer(
+            authorizer_id,
+            jwt_issuer=user_pool.user_pool_provider_url,
+            jwt_audience=[user_pool_client.user_pool_client_id],
+        )
+
+        return authorizer
+
+    def create_cognito_user_pool(self):
+        user_pool_id = f"{self.project_name}-{self.env_name}-UserPool"
+        user_pool = cognito.UserPool(
+            self, 
+            user_pool_id, 
+            user_pool_name=user_pool_id
+        )
+
+        user_pool_client_id = f"{self.project_name}-{self.env_name}-UserPoolClient"
+        user_pool_client = cognito.UserPoolClient(
+            self,
+            user_pool_client_id,
+            user_pool=user_pool,
+        )
+
+        return user_pool, user_pool_client
+    
     def load_config(self, path="config.yaml"):
         with open(path) as f:
             return yaml.safe_load(f)

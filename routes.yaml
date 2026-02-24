@@ -10,3 +10,4 @@ routes:
   - path: /dynamodb
     method: POST
     handler: handle_dynamo.post
+    auth: true
