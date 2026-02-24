@@ -1,10 +1,10 @@
 import os
 import boto3
 
-
-TABLE_NAME = os.environ["DYNAMODB_TABLE"]
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
+
+table_name = os.getenv("DYNAMODB_TABLE")
+table = dynamodb.Table(table_name)
 
 
 def put_item(item: dict):

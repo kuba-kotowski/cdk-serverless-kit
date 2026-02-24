@@ -6,6 +6,7 @@ from aws_cdk import (
     Duration,
     aws_lambda as _lambda,
     aws_cognito as cognito,
+    aws_secretsmanager as secretsmanager,
     aws_apigatewayv2 as apigateway2,
     aws_apigatewayv2_integrations as integrations,
     aws_apigatewayv2_authorizers as authorizers,
@@ -38,7 +39,11 @@ class ServerlessStack(Stack):
             authorizer = None
             if config.get("auth"):
                 if config["auth"] == "lambda":
-                    authorizer = self.create_lambda_authorizer("auth.handler", table)
+                    self.secret_key = config.get("secret_key", "api_key")
+                    
+                    secret = self.create_secret_api_key()
+                    authorizer = self.create_lambda_authorizer("auth.handler", table, secret)
+                
                 elif config["auth"] == "cognito":
                     authorizer = self.create_jwt_authorizer()
 
@@ -70,11 +75,12 @@ class ServerlessStack(Stack):
             
             integration_id = f"{method}-{safe_path}-integration"
             
+            kwargs = {"authorizer": authorizer} if route.get("auth") else {}
             api.add_routes(
                 path=path,
                 methods=[getattr(apigateway2.HttpMethod, method)],
                 integration=integrations.HttpLambdaIntegration(integration_id, fn),
-                authorizer=authorizer if route.get("auth") else None
+                **kwargs
             )
 
     def create_lambda(self, function_id, handler, table):
@@ -136,6 +142,7 @@ class ServerlessStack(Stack):
                 max_age=Duration.days(1)
             )
         )
+        
         api.add_stage(
             f"{self.env_name}",
             auto_deploy=True
@@ -143,22 +150,42 @@ class ServerlessStack(Stack):
 
         return api
 
-    def create_lambda_authorizer(self, auth_handler, table):
+    def create_secret_api_key(self):
+        secret_id = f"{self.project_name}-{self.env_name}-ApiKey"
+        secret = secretsmanager.Secret(
+            self,
+            secret_id,
+            secret_name=secret_id,
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                secret_string_template=f'{{"{self.secret_key}": ""}}',
+                generate_string_key=self.secret_key
+            ),
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
+        return secret
+
+    def create_lambda_authorizer(self, auth_handler, table, secret):
         authorizer_id = f"{self.project_name}-{self.env_name}-LambdaAuthorizer"
         fn = self.create_lambda(f"{authorizer_id}", auth_handler, table)
         
         # Grant Secrets Manager permissions to authorizer if secrets manager is used in the handler
-        fn.add_to_role_policy(
-            iam.PolicyStatement(
-                effect=iam.Effect.ALLOW,
-                actions=["secretsmanager:GetSecretValue"],
-                resources=[f"arn:aws:secretsmanager:{self.region}:{self.account}:secret:my-api-key-*"]
+        if secret:
+            fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[f"arn:aws:secretsmanager:{self.region}:{self.account}:secret:{secret.secret_name}-*"]
+                )
             )
-        )
+            fn.add_environment("SECRET_ID", secret.secret_name)
+            fn.add_environment("SECRET_KEY", self.secret_key)
 
         authorizer = authorizers.HttpLambdaAuthorizer(
             authorizer_id,
             handler=fn,
+            identity_source=["$request.header.Authorization"],
+            response_types=[authorizers.HttpLambdaResponseType.SIMPLE]
         )
 
         return authorizer
@@ -180,14 +207,15 @@ class ServerlessStack(Stack):
         user_pool = cognito.UserPool(
             self, 
             user_pool_id, 
-            user_pool_name=user_pool_id
+            user_pool_name=user_pool_id,
+            removal_policy=RemovalPolicy.DESTROY
         )
 
         user_pool_client_id = f"{self.project_name}-{self.env_name}-UserPoolClient"
         user_pool_client = cognito.UserPoolClient(
             self,
             user_pool_client_id,
-            user_pool=user_pool,
+            user_pool=user_pool
         )
 
         return user_pool, user_pool_client

@@ -5,6 +5,7 @@ region: eu-central-1
 env_name: main
 
 api_gateway: true
-auth: cognito # options: null, cognito, lambda
+auth: lambda # options: null, cognito, lambda
+secret_key: api_key # optional for lambda authorizer, default is 'api_key'
 
 dynamodb: true
